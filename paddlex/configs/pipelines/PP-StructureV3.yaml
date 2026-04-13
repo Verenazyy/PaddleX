@@ -23,7 +23,7 @@ markdown_ignore_labels:
 
 # Optional: PDF/OCR 文本框归到版式块时，要求「框面积的至少该比例落在块内」才匹配；每框只归到一个块。
 # 不设或 null 则沿用原逻辑（粗重叠即可，一框可对应多块）。
-# layout_ocr_min_coverage: 0.7
+layout_ocr_min_coverage: 0.7
 
 SubModules:
   LayoutDetection:

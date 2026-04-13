@@ -1,3 +1,33 @@
+"""Backward-compatible middle export API.
+
+Core implementation has been moved into `layout_parsing/middle_exporter/`.
+Keep this module as a stable import surface for existing callers.
+"""
+
+from .middle_exporter import (
+    MiddleExportConfig,
+    assign_ocr_indices_exclusive_by_coverage,
+    build_layout_block_to_ocr_exclusive,
+    export_middle_bundle,
+    layout_parsing_result_to_middle_page,
+    run_pp_structure_v3_to_middle,
+    save_middle_page_json,
+    save_middle_page_visualization,
+    write_middle_index_json,
+)
+
+__all__ = [
+    "MiddleExportConfig",
+    "assign_ocr_indices_exclusive_by_coverage",
+    "build_layout_block_to_ocr_exclusive",
+    "layout_parsing_result_to_middle_page",
+    "write_middle_index_json",
+    "save_middle_page_json",
+    "save_middle_page_visualization",
+    "export_middle_bundle",
+    "run_pp_structure_v3_to_middle",
+]
+
 # Copyright (c) 2024 PaddlePaddle Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import cv2
 
 from .layout_objects import LayoutBlock
 from .setting import BLOCK_LABEL_MAP
@@ -58,6 +89,30 @@ def img_axis_aligned_box_to_pdf_top_left(
     py1 = y1 / img_h * pdf_h
     py2 = y2 / img_h * pdf_h
     return [px1, py1, px2, py2]
+
+
+def pdf_top_left_box_to_img(
+    box: Sequence[float],
+    img_w: int,
+    img_h: int,
+    pdf_w: float,
+    pdf_h: float,
+) -> List[int]:
+    """Map PDF top-left box to image pixel box."""
+    x1, y1, x2, y2 = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+    ix1 = int(round((x1 / pdf_w) * img_w))
+    ix2 = int(round((x2 / pdf_w) * img_w))
+    iy1 = int(round((y1 / pdf_h) * img_h))
+    iy2 = int(round((y2 / pdf_h) * img_h))
+    ix1 = max(0, min(img_w - 1, ix1))
+    ix2 = max(0, min(img_w - 1, ix2))
+    iy1 = max(0, min(img_h - 1, iy1))
+    iy2 = max(0, min(img_h - 1, iy2))
+    if ix2 < ix1:
+        ix1, ix2 = ix2, ix1
+    if iy2 < iy1:
+        iy1, iy2 = iy2, iy1
+    return [ix1, iy1, ix2, iy2]
 
 
 def ocr_coverage_in_block(ocr_box: np.ndarray, block_box: np.ndarray) -> float:
@@ -267,6 +322,166 @@ def _char_positions_from_pdfium_chars(
     return out
 
 
+def _bbox_union(boxes: List[Sequence[float]]) -> List[float]:
+    """Return enclosing bbox for a list of boxes."""
+    if not boxes:
+        return [0.0, 0.0, 0.0, 0.0]
+    arr = np.asarray(boxes, dtype=np.float64)
+    return [
+        float(np.min(arr[:, 0])),
+        float(np.min(arr[:, 1])),
+        float(np.max(arr[:, 2])),
+        float(np.max(arr[:, 3])),
+    ]
+
+
+def _group_spans_to_lines_in_column(spans: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Group spans into lines inside one x-column."""
+    spans_sorted = sorted(
+        spans,
+        key=lambda s: (
+            (float(s["span_bbox_img"][1]) + float(s["span_bbox_img"][3])) * 0.5,
+            float(s["span_bbox_img"][0]),
+        ),
+    )
+    lines: List[List[Dict[str, Any]]] = []
+    line_bboxes: List[List[float]] = []
+    for span in spans_sorted:
+        sb = np.asarray(span["span_bbox_img"], dtype=np.float64)
+        sh = max(1.0, float(sb[3] - sb[1]))
+        scy = (float(sb[1]) + float(sb[3])) * 0.5
+        matched_idx = None
+        best_dist = float("inf")
+        for li, lb in enumerate(line_bboxes):
+            lcy = (float(lb[1]) + float(lb[3])) * 0.5
+            lh = max(1.0, float(lb[3] - lb[1]))
+            inter_h = max(0.0, min(float(sb[3]), float(lb[3])) - max(float(sb[1]), float(lb[1])))
+            overlap_small = inter_h / min(sh, lh)
+            y_dist = abs(scy - lcy)
+            if overlap_small >= 0.45 or y_dist <= max(2.0, 0.35 * min(sh, lh)):
+                if y_dist < best_dist:
+                    best_dist = y_dist
+                    matched_idx = li
+        if matched_idx is None:
+            lines.append([span])
+            line_bboxes.append([float(sb[0]), float(sb[1]), float(sb[2]), float(sb[3])])
+        else:
+            lines[matched_idx].append(span)
+            lb = line_bboxes[matched_idx]
+            line_bboxes[matched_idx] = [
+                min(lb[0], float(sb[0])),
+                min(lb[1], float(sb[1])),
+                max(lb[2], float(sb[2])),
+                max(lb[3], float(sb[3])),
+            ]
+    lines = sorted(
+        lines,
+        key=lambda line: (
+            min((float(s["span_bbox_img"][1]) + float(s["span_bbox_img"][3])) * 0.5 for s in line),
+            min(float(s["span_bbox_img"][0]) for s in line),
+        ),
+    )
+    for line in lines:
+        line.sort(key=lambda s: float(s["span_bbox_img"][0]))
+    return lines
+
+
+def _split_spans_into_columns(spans: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Split spans into x-columns first to reduce cross-column line merge."""
+    if not spans:
+        return []
+    spans_sorted = sorted(spans, key=lambda s: float(s["span_bbox_img"][0]))
+    widths = [
+        max(1.0, float(s["span_bbox_img"][2]) - float(s["span_bbox_img"][0]))
+        for s in spans_sorted
+    ]
+    median_w = float(np.median(np.asarray(widths, dtype=np.float64))) if widths else 8.0
+    col_gap_threshold = max(20.0, 4.0 * median_w)
+
+    columns: List[List[Dict[str, Any]]] = []
+    col_ranges: List[List[float]] = []
+    for sp in spans_sorted:
+        x1, _, x2, _ = [float(v) for v in sp["span_bbox_img"]]
+        assigned = False
+        for ci, rg in enumerate(col_ranges):
+            inter = max(0.0, min(x2, rg[1]) - max(x1, rg[0]))
+            min_w = max(1.0, min(x2 - x1, rg[1] - rg[0]))
+            close = (x1 <= rg[1] + col_gap_threshold) and (x2 >= rg[0] - col_gap_threshold)
+            if inter / min_w >= 0.1 or close:
+                columns[ci].append(sp)
+                col_ranges[ci] = [min(rg[0], x1), max(rg[1], x2)]
+                assigned = True
+                break
+        if not assigned:
+            columns.append([sp])
+            col_ranges.append([x1, x2])
+
+    cols_sorted = sorted(
+        zip(columns, col_ranges),
+        key=lambda pair: pair[1][0],
+    )
+    return [c for c, _ in cols_sorted]
+
+
+def _group_spans_to_lines(spans: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Two-stage line grouping: split columns by x, then cluster lines by y in each column."""
+    if not spans:
+        return []
+    columns = _split_spans_into_columns(spans)
+    lines_all: List[List[Dict[str, Any]]] = []
+    for col in columns:
+        lines_all.extend(_group_spans_to_lines_in_column(col))
+    return lines_all
+
+
+def _merge_line_spans_by_runs(line_spans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merge adjacent spans in one line to avoid per-character spans.
+    Since PDFium style fields are not exposed here, we merge by geometry continuity.
+    """
+    if not line_spans:
+        return []
+    if len(line_spans) == 1:
+        return line_spans
+
+    spans = sorted(line_spans, key=lambda s: float(s["span_bbox_img"][0]))
+    widths = [max(1.0, float(s["span_bbox_img"][2]) - float(s["span_bbox_img"][0])) for s in spans]
+    median_w = float(np.median(np.asarray(widths, dtype=np.float64))) if widths else 8.0
+    merge_gap = max(2.0, 0.8 * median_w)
+
+    merged: List[Dict[str, Any]] = []
+    cur = dict(spans[0])
+    cur["char_positions"] = list(cur.get("char_positions", []))
+
+    for nxt in spans[1:]:
+        cur_box = cur["span_bbox_img"]
+        nxt_box = nxt["span_bbox_img"]
+        gap = float(nxt_box[0]) - float(cur_box[2])
+        same_tag = (
+            cur.get("type") == nxt.get("type")
+            and cur.get("char_source") == nxt.get("char_source")
+        )
+        if same_tag and gap <= merge_gap:
+            cur["content"] = f"{cur.get('content', '')}{nxt.get('content', '')}"
+            cur["span_bbox_img"] = _bbox_union([cur_box, nxt_box])
+            cur["span_bbox_pdf"] = [
+                round(v, 2)
+                for v in _bbox_union([cur.get("span_bbox_pdf", cur_box), nxt.get("span_bbox_pdf", nxt_box)])
+            ]
+            cur["score"] = float(max(float(cur.get("score", 0.0)), float(nxt.get("score", 0.0))))
+            cur["char_positions"] = list(cur.get("char_positions", [])) + list(
+                nxt.get("char_positions", [])
+            )
+            for pos, ch in enumerate(cur["char_positions"]):
+                ch["position_in_span"] = pos
+        else:
+            merged.append(cur)
+            cur = dict(nxt)
+            cur["char_positions"] = list(cur.get("char_positions", []))
+    merged.append(cur)
+    return merged
+
+
 def layout_parsing_result_to_middle_page(
     result: Any,
     *,
@@ -426,14 +641,16 @@ def layout_parsing_result_to_middle_page(
 
         ocr_idxes = assign.get(bi, [])
         lines_out: List[Dict[str, Any]] = []
-        for line_i, ocr_i in enumerate(ocr_idxes):
+        span_candidates: List[Dict[str, Any]] = []
+        for ocr_i in ocr_idxes:
             txt = str(rec_texts[ocr_i])
+            if not txt:
+                continue
             sc = float(rec_scores[ocr_i]) if ocr_i < len(rec_scores) else 1.0
             ocr_img = rec_boxes[ocr_i]
             span_pdf = img_axis_aligned_box_to_pdf_top_left(
                 ocr_img, img_w, img_h, pdf_w, pdf_h
             )
-            line_pdf = list(span_pdf)
             char_positions = _char_positions_from_pdfium_chars(pdfium_chars, ocr_img)
             used_char_source = char_source
             if not char_positions:
@@ -441,18 +658,37 @@ def layout_parsing_result_to_middle_page(
                     txt, span_pdf, global_char_idx
                 )
                 used_char_source = "approx_fallback"
+            span_candidates.append(
+                {
+                    "span_bbox_img": [float(v) for v in ocr_img],
+                    "span_bbox_pdf": [round(x, 2) for x in span_pdf],
+                    "score": sc,
+                    "content": txt,
+                    "type": "text",
+                    "char_positions": char_positions,
+                    "char_source": used_char_source,
+                }
+            )
+        grouped = _group_spans_to_lines(span_candidates)
+        for line_i, line_spans in enumerate(grouped):
+            line_spans = _merge_line_spans_by_runs(line_spans)
+            line_img_box = _bbox_union([s["span_bbox_img"] for s in line_spans])
+            line_pdf = img_axis_aligned_box_to_pdf_top_left(
+                line_img_box, img_w, img_h, pdf_w, pdf_h
+            )
             lines_out.append(
                 {
                     "bbox": [round(x, 2) for x in line_pdf],
                     "spans": [
                         {
-                            "bbox": [round(x, 2) for x in span_pdf],
-                            "score": sc,
-                            "content": txt,
-                            "type": "text",
-                            "char_positions": char_positions,
-                            "char_source": used_char_source,
+                            "bbox": s["span_bbox_pdf"],
+                            "score": s["score"],
+                            "content": s["content"],
+                            "type": s["type"],
+                            "char_positions": s["char_positions"],
+                            "char_source": s["char_source"],
                         }
+                        for s in line_spans
                     ],
                     "index": line_i,
                 }
@@ -489,6 +725,12 @@ def layout_parsing_result_to_middle_page(
                 "index": bi,
             }
         )
+    # Remove empty text/title para blocks (no lines), keep vision/table/formula blocks.
+    para_blocks = [
+        p
+        for p in para_blocks
+        if p.get("type") not in ("text", "title") or len(p.get("lines", [])) > 0
+    ]
 
     page_entry = {
         "page_idx": page_idx,
@@ -539,6 +781,49 @@ def save_middle_page_json(
     return path
 
 
+def save_middle_page_visualization(
+    page_dict: Dict[str, Any],
+    page_result: Any,
+    output_dir: Union[str, Path],
+    *,
+    vis_subdir: str = "middle_vis",
+) -> Optional[Path]:
+    """
+    Save line/span visualization for one middle page.
+    Green = line bbox, Blue = span bbox.
+    """
+    if "doc_preprocessor_res" not in page_result:
+        return None
+    img = page_result["doc_preprocessor_res"].get("output_img", None)
+    if img is None:
+        return None
+    vis = np.array(img).copy()
+    if vis.ndim != 3 or vis.shape[2] != 3:
+        return None
+
+    page = page_dict["pdf_info"][0]
+    page_size = page["page_size"]
+    pdf_w, pdf_h = float(page_size[0]), float(page_size[1])
+    img_h, img_w = vis.shape[0], vis.shape[1]
+
+    for para in page.get("para_blocks", []):
+        for line in para.get("lines", []):
+            lb = pdf_top_left_box_to_img(line["bbox"], img_w, img_h, pdf_w, pdf_h)
+            cv2.rectangle(vis, (lb[0], lb[1]), (lb[2], lb[3]), (0, 180, 0), 2)
+            for span in line.get("spans", []):
+                sb = pdf_top_left_box_to_img(
+                    span["bbox"], img_w, img_h, pdf_w, pdf_h
+                )
+                cv2.rectangle(vis, (sb[0], sb[1]), (sb[2], sb[3]), (255, 0, 0), 1)
+
+    out = Path(output_dir) / vis_subdir
+    out.mkdir(parents=True, exist_ok=True)
+    page_idx = int(page["page_idx"])
+    path = out / f"page_{page_idx:04d}_line_span_vis.png"
+    cv2.imwrite(str(path), vis)
+    return path
+
+
 def export_middle_bundle(
     results: Sequence[Any],
     output_dir: Union[str, Path],
@@ -546,6 +831,8 @@ def export_middle_bundle(
     min_ocr_coverage: float = 0.7,
     pages_subdir: str = "middle_pages",
     char_source: str = "pdf_text",
+    save_vis: bool = False,
+    vis_subdir: str = "middle_vis",
 ) -> None:
     """
     Export a full document: ``middle_index.json`` + ``middle_pages/page_XXXX.json`` for each page result.
@@ -573,3 +860,10 @@ def export_middle_bundle(
             item, min_ocr_coverage=min_ocr_coverage, char_source=char_source
         )
         save_middle_page_json(page_dict, out, pages_subdir=pages_subdir)
+        if save_vis:
+            save_middle_page_visualization(
+                page_dict,
+                item,
+                out,
+                vis_subdir=vis_subdir,
+            )
