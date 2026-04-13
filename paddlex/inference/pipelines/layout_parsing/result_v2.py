@@ -182,6 +182,18 @@ class LayoutParsingResultV2(
 ):
     """Layout Parsing Result V2"""
 
+    def to_middle_page_dict(
+        self, min_ocr_coverage: float = 0.7, char_source: str = "pdf_text"
+    ) -> dict:
+        """Export one page in ``middle_pages/page_XXXX.json`` shape (see ``middle_export``)."""
+        from .middle_export import layout_parsing_result_to_middle_page
+
+        return layout_parsing_result_to_middle_page(
+            self,
+            min_ocr_coverage=min_ocr_coverage,
+            char_source=char_source,
+        )
+
     def __init__(self, data) -> None:
         """Initializes a new instance of the class with the specified data."""
         super().__init__(data)

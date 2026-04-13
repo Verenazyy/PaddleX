@@ -33,6 +33,7 @@ from ..base import BasePipeline
 from ..ocr.result import OCRResult
 from ..pp_doctranslation.result import MarkdownResult
 from .layout_objects import LayoutBlock, LayoutRegion
+from .middle_export import build_layout_block_to_ocr_exclusive
 from .result_v2 import LayoutParsingResultV2
 from .setting import BLOCK_LABEL_MAP, BLOCK_SETTINGS, REGION_SETTINGS
 from .utils import (
@@ -383,6 +384,9 @@ class _LayoutParsingPipelineV2(BasePipeline):
                 "aside_text",
             ],
         )
+        # If set (e.g. 0.7), each OCR/PDF-text box is assigned to at most one layout block
+        # when intersection_area/ocr_area >= this value (see middle_export).
+        self.layout_ocr_min_coverage = config.get("layout_ocr_min_coverage")
 
         return
 
@@ -495,6 +499,15 @@ class _LayoutParsingPipelineV2(BasePipeline):
         # convert formula_res_list to OCRResult format
         convert_formula_res_to_ocr_format(formula_res_list, overall_ocr_res)
 
+        exclusive_ocr_map = None
+        use_cov = getattr(self, "layout_ocr_min_coverage", None)
+        if use_cov is not None:
+            exclusive_ocr_map = build_layout_block_to_ocr_exclusive(
+                layout_det_res,
+                overall_ocr_res,
+                float(use_cov),
+            )
+
         # match layout boxes and ocr boxes and get some information for layout_order_config
         for box_idx, box_info in enumerate(layout_det_res["boxes"]):
             box = box_info["coordinate"]
@@ -519,9 +532,12 @@ class _LayoutParsingPipelineV2(BasePipeline):
                 doc_title_num += 1
 
             if label not in ["formula", "table", "seal"]:
-                _, matched_idxes = get_sub_regions_ocr_res(
-                    overall_ocr_res, [box], return_match_idx=True
-                )
+                if exclusive_ocr_map is not None:
+                    matched_idxes = exclusive_ocr_map.get(box_idx, [])
+                else:
+                    _, matched_idxes = get_sub_regions_ocr_res(
+                        overall_ocr_res, [box], return_match_idx=True
+                    )
                 block_to_ocr_map[box_idx] = matched_idxes
                 for matched_idx in matched_idxes:
                     if matched_ocr_dict.get(matched_idx, None) is None:
