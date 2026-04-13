@@ -16,7 +16,31 @@
 Fusion operators
 """
 import paddle
-from paddle.incubate.nn.functional import fused_rms_norm_ext
+
+# fused_rms_norm_ext is only available in newer Paddle builds; older wheels expose fused_rms_norm only.
+try:
+    from paddle.incubate.nn.functional import fused_rms_norm_ext
+except ImportError:
+
+    def fused_rms_norm_ext(hidden_states, weight, variance_epsilon):
+        fn = getattr(
+            paddle.incubate.nn.functional, "fused_rms_norm", None
+        )
+        if fn is not None:
+            return fn(
+                hidden_states,
+                weight,
+                None,
+                variance_epsilon,
+                hidden_states.dim() - 1,
+            )
+        variance = hidden_states.astype("float32").pow(2).mean(-1, keepdim=True)
+        out = (
+            paddle.rsqrt(variance + variance_epsilon) * hidden_states
+        ).astype(weight.dtype) * weight
+        return (out,)
+
+
 from paddle.incubate.nn.functional import fused_rotary_position_embedding as fused_rope
 from paddle.incubate.nn.functional import swiglu as fused_swiglu
 
@@ -25,7 +49,15 @@ from .common_fusion_ops import Linear, matmul
 if paddle.device.is_compiled_with_custom_device("npu"):
     from .npu_fusion_ops import npu_cal_aux_loss_func as cal_aux_loss
 else:
-    from paddle.incubate.nn.functional import cal_aux_loss
+    try:
+        from paddle.incubate.nn.functional import cal_aux_loss
+    except ImportError:
+        def cal_aux_loss(*args, **kwargs):
+            raise RuntimeError(
+                "`cal_aux_loss` is unavailable in current Paddle wheel. "
+                "Please upgrade PaddlePaddle to a version that provides "
+                "`paddle.incubate.nn.functional.cal_aux_loss` if this op is required."
+            )
 
 __all__ = [
     "fused_rope",

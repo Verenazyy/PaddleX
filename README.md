@@ -1157,3 +1157,7 @@ for res in output:
 ## 📄 许可证书
 
 本项目的发布受 [Apache 2.0 license](./LICENSE) 许可认证。
+
+\\wsl$\Ubuntu\home\hp\PaddleX\paddlex\inference\pipelines\layout_parsing\pipeline_v2.py
+
+python api_examples/pipelines/verify_pp_structure_v3_pdf_textlayer.py B_007.pdf --save-json --save-vis --out output_verify_pp_structure_v3_pdf

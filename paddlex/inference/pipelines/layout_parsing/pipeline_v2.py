@@ -55,6 +55,157 @@ from .xycut_enhanced import xycut_enhanced
 class _LayoutParsingPipelineV2(BasePipeline):
     """Layout Parsing Pipeline V2"""
 
+    def _try_build_overall_ocr_res_from_pdf_textlayer(
+        self,
+        *,
+        input_path: str,
+        page_index: Optional[int],
+        page_count: Optional[int],
+        doc_preprocessor_image: np.ndarray,
+        min_rec_boxes: int = 3,
+        min_total_chars: int = 20,
+    ) -> Optional[OCRResult]:
+        """
+        Try to extract PDF text layer (pdfium) and adapt to PaddleX overall_ocr_res.
+
+        Returns:
+            OCRResult on success, otherwise None.
+        """
+        if not input_path or not isinstance(input_path, str):
+            return None
+        if not input_path.lower().endswith(".pdf"):
+            return None
+        if page_index is None:
+            return None
+
+        try:
+            import pypdfium2 as pdfium  # type: ignore
+        except Exception:
+            return None
+
+        h, w = doc_preprocessor_image.shape[0:2]
+        if h <= 0 or w <= 0:
+            return None
+
+        try:
+            pdf = pdfium.PdfDocument(input_path)
+            page = pdf.get_page(int(page_index))
+            textpage = page.get_textpage()
+
+            # PDF canvas units (typically points). Origin: bottom-left.
+            pdf_w = float(page.get_width())
+            pdf_h = float(page.get_height())
+            if pdf_w <= 0 or pdf_h <= 0:
+                return None
+
+            # Prefer rect-based extraction (better "line/block" granularity than char boxes).
+            rec_texts: List[str] = []
+            rec_scores: List[float] = []
+            rec_polys: List[np.ndarray] = []
+            dt_polys: List[np.ndarray] = []
+
+            # Helper: map PDF coords -> image pixel coords (top-left origin).
+            def _pdf_xy_to_px(x_pdf: float, y_pdf: float) -> Tuple[int, int]:
+                x_px = int(round((x_pdf / pdf_w) * w))
+                y_px = int(round(((pdf_h - y_pdf) / pdf_h) * h))
+                x_px = max(0, min(w - 1, x_px))
+                y_px = max(0, min(h - 1, y_px))
+                return x_px, y_px
+
+            # pypdfium2 PdfTextPage APIs vary slightly by version; keep it defensive.
+            text_len = None
+            if hasattr(textpage, "count_chars"):
+                text_len = int(textpage.count_chars())
+            elif hasattr(textpage, "get_char_count"):
+                text_len = int(textpage.get_char_count())
+
+            rect_count = 0
+            if text_len is not None and hasattr(textpage, "count_rects"):
+                rect_count = int(textpage.count_rects(0, text_len))
+
+            if rect_count <= 0 and text_len is not None and hasattr(textpage, "get_charbox"):
+                # If rects are unavailable, bbox can't be reliably aggregated -> treat as not usable.
+                return None
+
+            for ridx in range(rect_count):
+                if not hasattr(textpage, "get_rect"):
+                    break
+                left, bottom, right, top = textpage.get_rect(ridx)
+                # Skip degenerate rects
+                if right <= left or top <= bottom:
+                    continue
+
+                # Extract text within this rect
+                txt = ""
+                if hasattr(textpage, "get_text_bounded"):
+                    try:
+                        txt = textpage.get_text_bounded(left, bottom, right, top) or ""
+                    except Exception:
+                        txt = ""
+                txt = re.sub(r"\s+", " ", txt).strip()
+                if not txt:
+                    continue
+
+                x1, y2 = _pdf_xy_to_px(float(left), float(bottom))
+                x2, y1 = _pdf_xy_to_px(float(right), float(top))
+                x_min, x_max = (x1, x2) if x1 <= x2 else (x2, x1)
+                y_min, y_max = (y1, y2) if y1 <= y2 else (y2, y1)
+
+                # Clamp to image bounds
+                x_min = max(0, min(w - 1, x_min))
+                x_max = max(0, min(w - 1, x_max))
+                y_min = max(0, min(h - 1, y_min))
+                y_max = max(0, min(h - 1, y_max))
+                if x_max <= x_min or y_max <= y_min:
+                    continue
+
+                poly = np.array(
+                    [
+                        [x_min, y_min],
+                        [x_max, y_min],
+                        [x_max, y_max],
+                        [x_min, y_max],
+                    ],
+                    dtype=np.int16,
+                )
+                rec_texts.append(txt)
+                rec_scores.append(1.0)
+                rec_polys.append(poly)
+                dt_polys.append(poly)
+
+            total_chars = sum(len(t) for t in rec_texts)
+            if len(rec_texts) < min_rec_boxes or total_chars < min_total_chars:
+                return None
+
+            rec_boxes = np.array(
+                [[p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max()] for p in rec_polys],
+                dtype=np.int16,
+            )
+
+            # Build OCRResult-compatible object (for downstream .img/.str/.json usage).
+            # Keep model_settings minimal but consistent with visualization code.
+            ocr_data: Dict[str, Any] = {
+                "input_path": input_path,
+                "page_index": page_index,
+                "model_settings": {"use_doc_preprocessor": False, "use_textline_orientation": False},
+                "doc_preprocessor_res": {"output_img": doc_preprocessor_image},
+                "dt_polys": dt_polys,
+                "text_det_params": {},
+                "text_type": "general",
+                "text_rec_score_thresh": 0.0,
+                "return_word_box": False,
+                "rec_texts": rec_texts,
+                "rec_scores": rec_scores,
+                "rec_polys": rec_polys,
+                "rec_boxes": rec_boxes,
+                "rec_labels": ["text"] * len(rec_texts),
+                "vis_fonts": [],
+            }
+            return OCRResult(ocr_data)
+        except Exception as e:
+            logging.debug(f"pdf textlayer extract failed: {e}")
+            return None
+
     def __init__(
         self,
         config: dict,
@@ -1098,23 +1249,55 @@ class _LayoutParsingPipelineV2(BasePipeline):
                     x_min, y_min, x_max, y_max = list(map(int, formula_res["dt_polys"]))
                     doc_preprocessor_image[y_min:y_max, x_min:x_max, :] = 255.0
 
-            overall_ocr_results = list(
-                self.general_ocr_pipeline(
-                    doc_preprocessor_images,
-                    use_textline_orientation=use_textline_orientation,
-                    text_det_limit_side_len=text_det_limit_side_len,
-                    text_det_limit_type=text_det_limit_type,
-                    text_det_thresh=text_det_thresh,
-                    text_det_box_thresh=text_det_box_thresh,
-                    text_det_unclip_ratio=text_det_unclip_ratio,
-                    text_rec_score_thresh=text_rec_score_thresh,
-                ),
+            # txt 优先、OCR 兜底：仅对 PDF 输入尝试 pdfium 文本层，成功则跳过 GeneralOCR
+            overall_ocr_results: List[Optional[OCRResult]] = [None] * len(
+                doc_preprocessor_images
             )
-
-            for overall_ocr_res in overall_ocr_results:
-                overall_ocr_res["rec_labels"] = ["text"] * len(
-                    overall_ocr_res["rec_texts"]
+            ocr_fallback_images = []
+            ocr_fallback_indices: List[int] = []
+            for i, (input_path, page_index, page_count, doc_img) in enumerate(
+                zip(
+                    batch_data.input_paths,
+                    batch_data.page_indexes,
+                    batch_data.page_counts,
+                    doc_preprocessor_images,
                 )
+            ):
+                textlayer_res = self._try_build_overall_ocr_res_from_pdf_textlayer(
+                    input_path=input_path,
+                    page_index=page_index,
+                    page_count=page_count,
+                    doc_preprocessor_image=doc_img,
+                )
+                if textlayer_res is not None:
+                    overall_ocr_results[i] = textlayer_res
+                else:
+                    ocr_fallback_images.append(doc_img)
+                    ocr_fallback_indices.append(i)
+
+            if ocr_fallback_images:
+                ocr_results_fallback = list(
+                    self.general_ocr_pipeline(
+                        ocr_fallback_images,
+                        use_textline_orientation=use_textline_orientation,
+                        text_det_limit_side_len=text_det_limit_side_len,
+                        text_det_limit_type=text_det_limit_type,
+                        text_det_thresh=text_det_thresh,
+                        text_det_box_thresh=text_det_box_thresh,
+                        text_det_unclip_ratio=text_det_unclip_ratio,
+                        text_rec_score_thresh=text_rec_score_thresh,
+                    ),
+                )
+                for idx_in_batch, ocr_res in zip(ocr_fallback_indices, ocr_results_fallback):
+                    ocr_res["rec_labels"] = ["text"] * len(ocr_res["rec_texts"])
+                    overall_ocr_results[idx_in_batch] = ocr_res
+
+            # Ensure 1:1 alignment with other per-page results
+            if any(res is None for res in overall_ocr_results):
+                raise RuntimeError(
+                    "overall_ocr_results alignment error: some pages have no OCR result"
+                )
+            overall_ocr_results = [res for res in overall_ocr_results]  # type: ignore[list-item]
 
             if model_settings["use_table_recognition"]:
                 table_res_lists = []

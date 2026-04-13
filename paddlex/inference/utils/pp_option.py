@@ -130,13 +130,15 @@ class PaddlePredictorOption(object):
         else:
             device_type, device_id = self.device_type, self.device_id
 
+        default_enable_new_ir = False if device_type == "cpu" else model_name not in NEWIR_BLOCKLIST
+
         default_config = {
             "run_mode": get_default_run_mode(model_name, device_type),
             "device_type": device_type,
             "device_id": device_id,
             "cpu_threads": 10,
             "delete_pass": [],
-            "enable_new_ir": True if model_name not in NEWIR_BLOCKLIST else False,
+            "enable_new_ir": default_enable_new_ir,
             "enable_cinn": False,
             "trt_cfg_setting": {},
             "trt_use_dynamic_shapes": True,  # only for trt
@@ -184,9 +186,11 @@ class PaddlePredictorOption(object):
             )
         self._update("device_type", device_type)
         set_env_for_device_type(device_type)
-        # XXX(gaotingquan): set flag to accelerate inference in paddle 3.0b2
-        if device_type in ("gpu", "cpu"):
-            os.environ["FLAGS_enable_pir_api"] = "1"
+        # Keep user-provided FLAGS untouched. Enabling PIR by default on CPU
+        # can trigger unsupported oneDNN + PIR combinations in some models.
+        # Only set the default for GPU; CPU should follow existing defaults.
+        if device_type == "gpu":
+            os.environ.setdefault("FLAGS_enable_pir_api", "1")
 
     @property
     def device_id(self):
