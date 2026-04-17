@@ -8,7 +8,37 @@ import cv2
 import numpy as np
 
 from .builder import layout_parsing_result_to_middle_page
-from .geometry import pdf_top_left_box_to_img
+from .geometry import pdf_bottom_left_box_to_img
+
+
+def _persist_image_assets(
+    page_dict: Dict[str, Any], page_result: Any, output_dir: Union[str, Path]
+) -> None:
+    if "parsing_res_list" not in page_result:
+        return
+    parsing_res_list = page_result["parsing_res_list"]
+    page = page_dict["pdf_info"][0]
+    for para in page.get("para_blocks", []):
+        if para.get("type") not in ("image", "seal"):
+            continue
+        block_idx = para.get("index", None)
+        if block_idx is None:
+            continue
+        if not isinstance(block_idx, int) or block_idx < 0 or block_idx >= len(parsing_res_list):
+            continue
+        block = parsing_res_list[block_idx]
+        if not getattr(block, "image", None) or not isinstance(block.image, dict):
+            continue
+        img_rel_path = str(block.image.get("path", "") or "")
+        img_obj = block.image.get("img", None)
+        if not img_rel_path or img_obj is None:
+            continue
+        save_path = Path(output_dir) / img_rel_path
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            img_obj.save(str(save_path))
+        except Exception:
+            continue
 
 
 def write_middle_index_json(
@@ -56,10 +86,10 @@ def save_middle_page_visualization(
     img_h, img_w = vis.shape[0], vis.shape[1]
     for para in page.get("para_blocks", []):
         for line in para.get("lines", []):
-            lb = pdf_top_left_box_to_img(line["bbox"], img_w, img_h, pdf_w, pdf_h)
+            lb = pdf_bottom_left_box_to_img(line["bbox"], img_w, img_h, pdf_w, pdf_h)
             cv2.rectangle(vis, (lb[0], lb[1]), (lb[2], lb[3]), (0, 180, 0), 2)
             for span in line.get("spans", []):
-                sb = pdf_top_left_box_to_img(span["bbox"], img_w, img_h, pdf_w, pdf_h)
+                sb = pdf_bottom_left_box_to_img(span["bbox"], img_w, img_h, pdf_w, pdf_h)
                 cv2.rectangle(vis, (sb[0], sb[1]), (sb[2], sb[3]), (255, 0, 0), 1)
     out = Path(output_dir) / vis_subdir
     out.mkdir(parents=True, exist_ok=True)
@@ -89,6 +119,7 @@ def export_middle_bundle(
         page_dict = layout_parsing_result_to_middle_page(
             item, min_ocr_coverage=min_ocr_coverage, char_source=char_source
         )
+        _persist_image_assets(page_dict, item, out)
         save_middle_page_json(page_dict, out, pages_subdir=pages_subdir)
         if save_vis:
             save_middle_page_visualization(page_dict, item, out, vis_subdir=vis_subdir)

@@ -1,0 +1,2 @@
+from paddlex.inference.pipelines.layout_parsing.middle_export import run_pp_structure_v3_to_middle
+run_pp_structure_v3_to_middle("B_010.pdf", output_dir="output_middle_test", min_ocr_coverage=0.7, save_vis=True)

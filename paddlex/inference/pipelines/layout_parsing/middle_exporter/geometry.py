@@ -47,6 +47,25 @@ def pdf_top_left_box_to_img(
     return [ix1, iy1, ix2, iy2]
 
 
+def pdf_bottom_left_box_to_img(
+    box: Sequence[float], img_w: int, img_h: int, pdf_w: float, pdf_h: float
+) -> List[int]:
+    x1, y1, x2, y2 = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+    ix1 = int(round((x1 / pdf_w) * img_w))
+    ix2 = int(round((x2 / pdf_w) * img_w))
+    iy1 = int(round(((pdf_h - y2) / pdf_h) * img_h))
+    iy2 = int(round(((pdf_h - y1) / pdf_h) * img_h))
+    ix1 = max(0, min(img_w - 1, ix1))
+    ix2 = max(0, min(img_w - 1, ix2))
+    iy1 = max(0, min(img_h - 1, iy1))
+    iy2 = max(0, min(img_h - 1, iy2))
+    if ix2 < ix1:
+        ix1, ix2 = ix2, ix1
+    if iy2 < iy1:
+        iy1, iy2 = iy2, iy1
+    return [ix1, iy1, ix2, iy2]
+
+
 def bbox_union(boxes: List[Sequence[float]]) -> List[float]:
     if not boxes:
         return [0.0, 0.0, 0.0, 0.0]

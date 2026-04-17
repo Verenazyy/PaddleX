@@ -1161,3 +1161,5 @@ for res in output:
 \\wsl$\Ubuntu\home\hp\PaddleX\paddlex\inference\pipelines\layout_parsing\pipeline_v2.py
 
 python api_examples/pipelines/verify_pp_structure_v3_pdf_textlayer.py B_007.pdf --save-json --save-vis --out output_verify_pp_structure_v3_pdf
+
+python api_examples/pipelines/export_middle_bundle.py B_007.pdf --out-dir output_middle_test --min-coverage 0.7 --save-vis

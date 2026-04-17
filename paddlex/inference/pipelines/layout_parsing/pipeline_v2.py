@@ -63,6 +63,7 @@ class _LayoutParsingPipelineV2(BasePipeline):
         page_index: Optional[int],
         page_count: Optional[int],
         doc_preprocessor_image: np.ndarray,
+        skip_boxes: Optional[List[Sequence[float]]] = None,
         min_rec_boxes: int = 3,
         min_total_chars: int = 20,
     ) -> Optional[OCRResult]:
@@ -120,6 +121,37 @@ class _LayoutParsingPipelineV2(BasePipeline):
             elif hasattr(textpage, "get_char_count"):
                 text_len = int(textpage.get_char_count())
 
+            # Build char-level cache once so rect text can be reconstructed
+            # with strict geometric consistency (chars whose centers fall in rect).
+            char_cache: List[Dict[str, Any]] = []
+            if (
+                text_len is not None
+                and hasattr(textpage, "get_charbox")
+                and hasattr(textpage, "get_text_range")
+            ):
+                for ci in range(text_len):
+                    try:
+                        c_left, c_bottom, c_right, c_top = textpage.get_charbox(ci)
+                    except Exception:
+                        continue
+                    ch = ""
+                    try:
+                        ch = textpage.get_text_range(ci, 1) or ""
+                    except Exception:
+                        ch = ""
+                    if not ch:
+                        continue
+                    cx = (float(c_left) + float(c_right)) * 0.5
+                    cy = (float(c_bottom) + float(c_top)) * 0.5
+                    char_cache.append(
+                        {
+                            "char": ch,
+                            "cx": cx,
+                            "cy": cy,
+                            "char_idx": ci,
+                        }
+                    )
+
             rect_count = 0
             if text_len is not None and hasattr(textpage, "count_rects"):
                 rect_count = int(textpage.count_rects(0, text_len))
@@ -138,7 +170,17 @@ class _LayoutParsingPipelineV2(BasePipeline):
 
                 # Extract text within this rect
                 txt = ""
-                if hasattr(textpage, "get_text_bounded"):
+                if char_cache:
+                    rect_chars = [
+                        c
+                        for c in char_cache
+                        if float(left) <= float(c["cx"]) <= float(right)
+                        and float(bottom) <= float(c["cy"]) <= float(top)
+                    ]
+                    if rect_chars:
+                        rect_chars.sort(key=lambda x: int(x["char_idx"]))
+                        txt = "".join(str(c["char"]) for c in rect_chars)
+                if not txt and hasattr(textpage, "get_text_bounded"):
                     try:
                         txt = textpage.get_text_bounded(left, bottom, right, top) or ""
                     except Exception:
@@ -159,6 +201,25 @@ class _LayoutParsingPipelineV2(BasePipeline):
                 y_max = max(0, min(h - 1, y_max))
                 if x_max <= x_min or y_max <= y_min:
                     continue
+
+                # Skip rects that overlap formula regions (to avoid duplicating inline_equation as text).
+                if skip_boxes:
+                    rect_box = [float(x_min), float(y_min), float(x_max), float(y_max)]
+                    rect_area = max(1.0, float((rect_box[2] - rect_box[0]) * (rect_box[3] - rect_box[1])))
+                    should_skip = False
+                    for sb in skip_boxes:
+                        if not (isinstance(sb, (list, tuple)) and len(sb) == 4):
+                            continue
+                        sbf = [float(v) for v in sb]
+                        inter = get_bbox_intersection(rect_box, sbf, return_format="bbox")
+                        if inter is None:
+                            continue
+                        ia = max(0.0, float((inter[2] - inter[0]) * (inter[3] - inter[1])))
+                        if ia / rect_area >= 0.2:
+                            should_skip = True
+                            break
+                    if should_skip:
+                        continue
 
                 poly = np.array(
                     [
@@ -1279,11 +1340,21 @@ class _LayoutParsingPipelineV2(BasePipeline):
                     doc_preprocessor_images,
                 )
             ):
+                # Use formula regions as skip boxes for pdfium textlayer extraction.
+                # This prevents formula glyphs (e.g. "𝐾𝑖") from being extracted as normal text,
+                # which would duplicate inline_equation LaTeX spans downstream.
+                skip_boxes = []
+                if i < len(formula_res_lists):
+                    for fr in formula_res_lists[i]:
+                        dt = fr.get("dt_polys", None) if isinstance(fr, dict) else None
+                        if isinstance(dt, (list, tuple)) and len(dt) == 4:
+                            skip_boxes.append(dt)
                 textlayer_res = self._try_build_overall_ocr_res_from_pdf_textlayer(
                     input_path=input_path,
                     page_index=page_index,
                     page_count=page_count,
                     doc_preprocessor_image=doc_img,
+                    skip_boxes=skip_boxes,
                 )
                 if textlayer_res is not None:
                     overall_ocr_results[i] = textlayer_res

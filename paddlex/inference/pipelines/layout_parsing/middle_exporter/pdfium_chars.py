@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 
@@ -69,7 +69,7 @@ def char_positions_from_pdfium_chars(
     chars: List[Dict[str, Any]], span_img_box: Sequence[float]
 ) -> List[Dict[str, Any]]:
     span_box = np.asarray(span_img_box, dtype=np.float64)
-    selected: List[Tuple[float, float, Dict[str, Any]]] = []
+    selected: List[Dict[str, Any]] = []
     for item in chars:
         ch_box = np.asarray(item["img_bbox"], dtype=np.float64)
         ch_area = float(calculate_bbox_area(ch_box))
@@ -80,10 +80,11 @@ def char_positions_from_pdfium_chars(
             continue
         if float(calculate_bbox_area(inter)) / ch_area < 0.5:
             continue
-        selected.append((((ch_box[1] + ch_box[3]) * 0.5), ch_box[0], item))
-    selected.sort(key=lambda x: (x[0], x[1]))
+        selected.append(item)
+    # Prefer PDF intrinsic character order to avoid jitter-induced swaps.
+    selected.sort(key=lambda x: (int(x["char_idx"]), float(x["img_bbox"][0]), float(x["img_bbox"][1])))
     out: List[Dict[str, Any]] = []
-    for pos, (_, _, item) in enumerate(selected):
+    for pos, item in enumerate(selected):
         out.append(
             {
                 "char": item["char"],
