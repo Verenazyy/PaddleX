@@ -11,7 +11,12 @@ from ..layout_objects import LayoutBlock
 from ..setting import BLOCK_LABEL_MAP
 from .geometry import bbox_union, img_axis_aligned_box_to_pdf_top_left, read_pdf_page_size_pts
 from .grouping import assign_ocr_indices_exclusive_by_coverage, group_spans_to_lines
-from .pdfium_chars import approx_char_bboxes, char_positions_from_pdfium_chars, read_pdfium_page_chars
+from .pdfium_chars import (
+    approx_char_bboxes,
+    char_positions_from_pdfium_chars,
+    read_pdfium_page_chars,
+    sanitize_middle_text,
+)
 
 
 def _convert_bbox_top_left_to_bottom_left(bbox: Sequence[float], page_h: float) -> List[float]:
@@ -38,7 +43,11 @@ def _flip_export_bboxes_to_bottom_left(obj: Any, page_h: float) -> None:
 
 def _is_discarded_block_label(label: str) -> bool:
     low = (label or "").lower()
-    return (low in BLOCK_LABEL_MAP["header_labels"]) or (low in BLOCK_LABEL_MAP["footer_labels"])
+    return (
+        (low in BLOCK_LABEL_MAP["header_labels"])
+        or (low in BLOCK_LABEL_MAP["footer_labels"])
+        or (low in ("number", "formula_number"))
+    )
 
 
 def _bbox_overlap_x(a: np.ndarray, b: np.ndarray) -> float:
@@ -236,6 +245,7 @@ def _build_table_cells(
     pdf_w: float,
     pdf_h: float,
     global_char_idx: int,
+    effective_char_source: str,
 ) -> Tuple[List[Dict[str, Any]], int]:
     cells_out: List[Dict[str, Any]] = []
     cell_boxes_raw = table_res_item.get("cell_box_list", [])
@@ -265,32 +275,25 @@ def _build_table_cells(
             rb_area = max(1.0, (rb_box[2] - rb_box[0]) * (rb_box[3] - rb_box[1]))
             if _bbox_intersection_area(rb_box, cell_box) / rb_area >= 0.3:
                 matched_indices.append(i)
-        matched_indices.sort(
-            key=lambda i: (
-                (float(rec_boxes[i][1]) + float(rec_boxes[i][3])) * 0.5,
-                float(rec_boxes[i][0]),
-            )
-        )
-        txt_parts: List[str] = []
         chars: List[Dict[str, Any]] = []
         for i in matched_indices:
-            txt = str(rec_texts[i]) if i < len(rec_texts) else ""
-            if txt:
-                txt_parts.append(txt)
+            txt = sanitize_middle_text(str(rec_texts[i])) if i < len(rec_texts) else ""
             rb = np.asarray(rec_boxes[i], dtype=np.float64)
-            cpos = char_positions_from_pdfium_chars(pdfium_chars, rb)
-            # Disable approx fallback: keep empty char positions if PDF chars unavailable.
+            span_pdf = img_axis_aligned_box_to_pdf_top_left(rb, img_w, img_h, pdf_w, pdf_h)
+            cpos, _span_source, global_char_idx = _pick_char_positions_for_span(
+                text=txt,
+                ocr_img_box=rb,
+                span_pdf_box=span_pdf,
+                pdfium_chars=pdfium_chars,
+                preferred_source=effective_char_source,
+                global_char_idx=global_char_idx,
+            )
             chars.extend(cpos)
         for pos, ch in enumerate(chars):
             ch["position_in_span"] = pos
         cell_idx = len(cells_out)
         html_text = html_cell_texts[cell_idx] if cell_idx < len(html_cell_texts) else ""
-        content = html_text if html_text else "".join(txt_parts)
-        if content and not chars:
-            cell_pdf = img_axis_aligned_box_to_pdf_top_left(
-                cell_np, img_w, img_h, pdf_w, pdf_h
-            )
-            # Disable approx fallback: keep empty char positions if PDF chars unavailable.
+        content = sanitize_middle_text(html_text)
         cells_out.append({"content": content, "char_positions": chars})
     return cells_out, global_char_idx
 
@@ -375,6 +378,10 @@ def layout_label_to_middle_para_type(label: str) -> str:
         return "title"
     if low in BLOCK_LABEL_MAP["vision_title_labels"]:
         return "title"
+    if low == "content":
+        return "content"
+    if low in ("number", "formula_number"):
+        return low
     if low == "table":
         return "table"
     if low in BLOCK_LABEL_MAP["image_labels"] or low in ("chart", "flowchart", "figure"):
@@ -468,6 +475,82 @@ def _contains_math_alphanumeric_symbols(text: str) -> bool:
     return False
 
 
+def _is_unreliable_char(ch: str) -> bool:
+    if not ch:
+        return True
+    if ch == "\ufffd":
+        return True
+    cat = unicodedata.category(ch)
+    if cat == "Cs":
+        return True
+    if cat.startswith("C") and ch not in ("\t", "\n", "\r"):
+        return True
+    return False
+
+
+def _pick_char_positions_for_span(
+    *,
+    text: str,
+    ocr_img_box: Sequence[float],
+    span_pdf_box: Sequence[float],
+    pdfium_chars: List[Dict[str, Any]],
+    preferred_source: str,
+    global_char_idx: int,
+) -> Tuple[List[Dict[str, Any]], str, int]:
+    """
+    MinerU-like region routing:
+    - Prefer pdf_text only when extracted chars are sufficiently reliable for this span.
+    - Fallback to OCR-derived approximate char boxes for this span only.
+    """
+    clean_text = sanitize_middle_text(text)
+    if not clean_text:
+        return [], preferred_source, int(global_char_idx)
+    if preferred_source != "pdf_text":
+        approx, nxt_idx = approx_char_bboxes(clean_text, span_pdf_box, int(global_char_idx))
+        return approx, "ocr_text", int(nxt_idx)
+
+    pdf_chars = char_positions_from_pdfium_chars(pdfium_chars, ocr_img_box)
+    if not pdf_chars:
+        approx, nxt_idx = approx_char_bboxes(clean_text, span_pdf_box, int(global_char_idx))
+        return approx, "ocr_text", int(nxt_idx)
+
+    bad = 0
+    for it in pdf_chars:
+        if _is_unreliable_char(str(it.get("char", ""))):
+            bad += 1
+    bad_ratio = float(bad) / max(1, len(pdf_chars))
+    coverage_ratio = float(len(pdf_chars)) / max(1, len(clean_text))
+
+    # Conservative span-level quality gate to avoid switching good spans.
+    if bad_ratio >= 0.05 or coverage_ratio < 0.35:
+        approx, nxt_idx = approx_char_bboxes(clean_text, span_pdf_box, int(global_char_idx))
+        return approx, "ocr_text", int(nxt_idx)
+    return pdf_chars, "pdf_text", int(global_char_idx)
+
+
+def _resolve_span_content(
+    default_text: str, char_positions: List[Dict[str, Any]], char_source: str
+) -> str:
+    """
+    Prefer PDF-char reconstructed text when available.
+    This keeps punctuation that OCR text may miss.
+    Falls back to OCR text when PDF-char reconstruction is shorter (chars dropped due to
+    missing ToUnicode mapping in the PDF font).
+    """
+    if str(char_source) != "pdf_text" or not char_positions:
+        return default_text
+    rebuilt = sanitize_middle_text(
+        "".join(str(ch.get("char", "") or "") for ch in char_positions)
+    )
+    if not rebuilt:
+        return default_text
+    # If PDF-char text is shorter than OCR text, the font encoding likely dropped some
+    # characters (e.g. punctuation with missing ToUnicode mapping). Prefer OCR in that case.
+    if len(rebuilt) < len(default_text):
+        return default_text
+    return rebuilt
+
+
 def _build_text_caption_block(
     *,
     caption_type: str,
@@ -475,6 +558,7 @@ def _build_text_caption_block(
     content: str,
     char_positions: List[Dict[str, Any]],
     line_index: int,
+    char_source: str,
 ) -> Dict[str, Any]:
     cap_bbox = [round(float(v), 2) for v in bbox]
     return {
@@ -490,7 +574,7 @@ def _build_text_caption_block(
                         "bbox": cap_bbox,
                         "score": 1.0,
                         "content": content,
-                        "char_source": "pdf_text",
+                        "char_source": str(char_source),
                         "char_positions": char_positions,
                     }
                 ],
@@ -618,6 +702,13 @@ def layout_parsing_result_to_middle_page(
     rec_boxes, rec_texts, rec_scores = overall_ocr["rec_boxes"], overall_ocr["rec_texts"], overall_ocr["rec_scores"]
     rec_labels_raw = overall_ocr.get("rec_labels", [])
     rec_labels = [] if rec_labels_raw is None else list(rec_labels_raw)
+    text_source_raw = str(overall_ocr.get("text_source", "") or "").strip().lower()
+    if text_source_raw == "ocr_text":
+        effective_char_source = "ocr_text"
+    elif text_source_raw == "pdf_text":
+        effective_char_source = "pdf_text"
+    else:
+        effective_char_source = str(char_source)
 
     # MinerU-style inline formula handling:
     # collect once, then fuse into text/title spans via a dedicated helper.
@@ -629,7 +720,13 @@ def layout_parsing_result_to_middle_page(
         # Exclude inline_formula blocks from text assignment; they will be merged as spans.
         if str(getattr(block, "label", "") or "").lower() == "inline_formula":
             continue
-        if layout_label_to_middle_para_type(block.label) in ("text", "title"):
+        if layout_label_to_middle_para_type(block.label) in (
+            "text",
+            "title",
+            "content",
+            "number",
+            "formula_number",
+        ):
             text_blocks.append((bi, np.asarray(block.bbox, dtype=np.float64)))
     assign = assign_ocr_indices_exclusive_by_coverage(rec_boxes, text_blocks, min_ocr_coverage)
 
@@ -713,17 +810,21 @@ def layout_parsing_result_to_middle_page(
 
         span_candidates_local: List[Dict[str, Any]] = []
         for ocr_i in assign.get(int(bi), []):
-            txt = str(rec_texts[ocr_i])
+            txt = sanitize_middle_text(str(rec_texts[ocr_i]))
             if not txt:
                 continue
             sc = float(rec_scores[ocr_i]) if ocr_i < len(rec_scores) else 1.0
             ocr_img = rec_boxes[ocr_i]
             span_pdf = img_axis_aligned_box_to_pdf_top_left(ocr_img, img_w, img_h, pdf_w, pdf_h)
-            char_positions = char_positions_from_pdfium_chars(pdfium_chars, ocr_img)
-            # Keep alignment with main text export: approximate when PDF chars can't represent math glyphs.
-            if char_source == "pdf_text" and txt and (not char_positions):
-                approx, global_char_idx = approx_char_bboxes(str(txt), span_pdf, int(global_char_idx))
-                char_positions = approx
+            char_positions, span_char_source, global_char_idx = _pick_char_positions_for_span(
+                text=txt,
+                ocr_img_box=ocr_img,
+                span_pdf_box=span_pdf,
+                pdfium_chars=pdfium_chars,
+                preferred_source=effective_char_source,
+                global_char_idx=global_char_idx,
+            )
+            span_content = _resolve_span_content(txt, char_positions, span_char_source)
             rec_label = str(rec_labels[ocr_i]).lower() if ocr_i < len(rec_labels) else "text"
             span_type = "inline_equation" if rec_label in ("formula", "inline_formula", "inline_equation") else "text"
             span_candidates_local.append(
@@ -731,10 +832,10 @@ def layout_parsing_result_to_middle_page(
                     span_bbox_img=ocr_img,
                     span_bbox_pdf=span_pdf,
                     score=sc,
-                    content=txt,
+                    content=span_content,
                     span_type=span_type,
                     char_positions=char_positions,
-                    char_source=char_source,
+                    char_source=span_char_source,
                 )
             )
 
@@ -760,7 +861,7 @@ def layout_parsing_result_to_middle_page(
             )
         if not lines_out_local and (block.content or "").strip():
             span_pdf = pdf_bbox_local
-            txt = block.content
+            txt = sanitize_middle_text(str(block.content))
             fb_line_idx = _next_line_index()
             lines_out_local.append(
                 {
@@ -920,15 +1021,25 @@ def layout_parsing_result_to_middle_page(
                 ci, cblk, cbox = best
                 cap_txt = str(getattr(cblk, "content", "") or "").strip()
                 if cap_txt:
+                    cap_txt = sanitize_middle_text(cap_txt)
+                if cap_txt:
                     cap_pdf = img_axis_aligned_box_to_pdf_top_left(cbox, img_w, img_h, pdf_w, pdf_h)
                     caption_bbox = [round(v, 2) for v in cap_pdf]
-                    caption_chars = char_positions_from_pdfium_chars(pdfium_chars, cbox)
+                    caption_chars, cap_char_source, global_char_idx = _pick_char_positions_for_span(
+                        text=cap_txt,
+                        ocr_img_box=cbox,
+                        span_pdf_box=caption_bbox,
+                        pdfium_chars=pdfium_chars,
+                        preferred_source=effective_char_source,
+                        global_char_idx=global_char_idx,
+                    )
                     # Delay index assignment so image body stays ahead of caption in reading order.
                     caption_payload = {
                         "ci": ci,
                         "bbox": caption_bbox,
                         "content": cap_txt,
                         "char_positions": caption_chars,
+                        "char_source": cap_char_source,
                     }
 
             # Keep para_blocks[].bbox as image body bbox (to match existing middle json shape).
@@ -973,9 +1084,11 @@ def layout_parsing_result_to_middle_page(
                         content=caption_payload["content"],
                         char_positions=caption_payload["char_positions"],
                         line_index=cap_line_idx,
+                        char_source=caption_payload.get("char_source", effective_char_source),
                     )
                 )
                 consumed_caption_indices.add(int(caption_payload["ci"]))
+                processed_caption_indices.add(int(caption_payload["ci"]))
 
             image_para_block = {
                 "type": "image",
@@ -1104,7 +1217,15 @@ def layout_parsing_result_to_middle_page(
                 processed_caption_indices.add(int(c_bi))
 
             table_cells, global_char_idx = _build_table_cells(
-                table_item, table_html, pdfium_chars, img_w, img_h, pdf_w, pdf_h, global_char_idx
+                table_item,
+                table_html,
+                pdfium_chars,
+                img_w,
+                img_h,
+                pdf_w,
+                pdf_h,
+                global_char_idx,
+                effective_char_source,
             )
             virtual_lines = _build_table_virtual_lines(
                 table_item, img_w, img_h, pdf_w, pdf_h, body_bbox
@@ -1183,28 +1304,29 @@ def layout_parsing_result_to_middle_page(
 
         span_candidates: List[Dict[str, Any]] = []
         for ocr_i in assign.get(bi, []):
-            txt = str(rec_texts[ocr_i])
+            txt = sanitize_middle_text(str(rec_texts[ocr_i]))
             if not txt:
                 continue
             sc = float(rec_scores[ocr_i]) if ocr_i < len(rec_scores) else 1.0
             ocr_img = rec_boxes[ocr_i]
             span_pdf = img_axis_aligned_box_to_pdf_top_left(ocr_img, img_w, img_h, pdf_w, pdf_h)
-            char_positions = char_positions_from_pdfium_chars(pdfium_chars, ocr_img)
-            # Fallback: when pdfium char boxes can't represent math-italic glyphs (e.g. 𝑖, 𝑗),
-            # approximate char boxes so downstream has consistent char_positions.
-            if char_source == "pdf_text" and txt and (not char_positions):
-                approx, global_char_idx = approx_char_bboxes(str(txt), span_pdf, int(global_char_idx))
-                char_positions = approx
+            char_positions, used_char_source, global_char_idx = _pick_char_positions_for_span(
+                text=txt,
+                ocr_img_box=ocr_img,
+                span_pdf_box=span_pdf,
+                pdfium_chars=pdfium_chars,
+                preferred_source=effective_char_source,
+                global_char_idx=global_char_idx,
+            )
+            span_content = _resolve_span_content(txt, char_positions, used_char_source)
             rec_label = str(rec_labels[ocr_i]).lower() if ocr_i < len(rec_labels) else "text"
             span_type = "inline_equation" if rec_label in ("formula", "inline_formula", "inline_equation") else "text"
-            used_char_source = char_source
-            # Disable approx fallback globally.
             span_candidates.append(
                 _build_span_candidate(
                     span_bbox_img=ocr_img,
                     span_bbox_pdf=span_pdf,
                     score=sc,
-                    content=txt,
+                    content=span_content,
                     span_type=span_type,
                     char_positions=char_positions,
                     char_source=used_char_source,

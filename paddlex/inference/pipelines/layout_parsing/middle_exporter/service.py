@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Union
+from typing import Any, Optional
 
 from .writer import export_middle_bundle
 
@@ -16,13 +16,18 @@ def run_pp_structure_v3_to_middle(
     use_doc_orientation_classify: bool = False,
     use_doc_unwarping: bool = False,
     use_textline_orientation: bool = False,
+    pipeline: Optional[Any] = None,
 ) -> None:
     """
     High-level API: run PP-StructureV3 on a PDF and export middle json files.
-    """
-    from paddlex import create_pipeline
 
-    pipeline = create_pipeline(pipeline="PP-StructureV3")
+    Pass a pre-created ``pipeline`` (from ``create_pipeline("PP-StructureV3")``)
+    to avoid reloading weights when processing many PDFs in a loop.
+    """
+    if pipeline is None:
+        from paddlex import create_pipeline
+
+        pipeline = create_pipeline(pipeline="PP-StructureV3")
     results = list(
         pipeline.predict(
             str(pdf_path),

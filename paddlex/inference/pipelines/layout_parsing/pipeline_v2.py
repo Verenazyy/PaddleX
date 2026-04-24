@@ -14,7 +14,9 @@
 from __future__ import annotations
 
 import copy
+import os
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -55,6 +57,55 @@ from .xycut_enhanced import xycut_enhanced
 @benchmark.time_methods
 class _LayoutParsingPipelineV2(BasePipeline):
     """Layout Parsing Pipeline V2"""
+
+    @staticmethod
+    def _is_suspicious_pdf_textlayer(rec_texts: List[str]) -> bool:
+        """Detect unreadable PDF text-layer output and trigger OCR fallback."""
+        if not rec_texts:
+            return True
+        joined = "".join(str(t) for t in rec_texts if t)
+        if not joined:
+            return True
+        total = len(joined)
+        if total < 20:
+            return False
+        readable = 0
+        han = 0
+        control = 0
+        replacement = 0
+        for ch in joined:
+            if ch == "\ufffd":
+                replacement += 1
+                continue
+            cat = unicodedata.category(ch)
+            if "\u4e00" <= ch <= "\u9fff":
+                han += 1
+                readable += 1
+                continue
+            if cat.startswith("L") or cat.startswith("N"):
+                readable += 1
+                continue
+            if cat == "Zs" or ch in ("\t", "\n", "\r"):
+                readable += 1
+                continue
+            if cat.startswith("C"):
+                control += 1
+        replacement_ratio = replacement / total
+        control_ratio = control / total
+        han_ratio = han / total
+        readable_ratio = readable / total
+        # Strict thresholds to avoid false-positive OCR fallback on normal PDFs.
+        if replacement_ratio >= 0.15:
+            return True
+        if control_ratio >= 0.08:
+            return True
+        # When there is enough Han text, trust text layer even with noisy symbols.
+        if han_ratio >= 0.05:
+            return False
+        # For non-Han pages, only reject near-garbage pages.
+        if total >= 120 and readable_ratio < 0.05:
+            return True
+        return False
 
     def _try_build_overall_ocr_res_from_pdf_textlayer(
         self,
@@ -124,21 +175,40 @@ class _LayoutParsingPipelineV2(BasePipeline):
             # Build char-level cache once so rect text can be reconstructed
             # with strict geometric consistency (chars whose centers fall in rect).
             char_cache: List[Dict[str, Any]] = []
+
+            # Try raw C API first — FPDFText_GetUnicode never silently drops chars
+            # with missing ToUnicode mappings (unlike get_text_range which returns "").
+            _raw_get_unicode = None
+            try:
+                import pypdfium2.raw as _pdfium_raw  # type: ignore
+                if hasattr(_pdfium_raw, "FPDFText_GetUnicode"):
+                    _raw_get_unicode = _pdfium_raw.FPDFText_GetUnicode
+            except Exception:
+                pass
+
             if (
                 text_len is not None
                 and hasattr(textpage, "get_charbox")
-                and hasattr(textpage, "get_text_range")
             ):
+                from .middle_exporter.pdfium_chars import _codepoint_to_char, _normalize_single_char
                 for ci in range(text_len):
                     try:
                         c_left, c_bottom, c_right, c_top = textpage.get_charbox(ci)
                     except Exception:
                         continue
                     ch = ""
-                    try:
-                        ch = textpage.get_text_range(ci, 1) or ""
-                    except Exception:
-                        ch = ""
+                    if _raw_get_unicode is not None:
+                        try:
+                            code = int(_raw_get_unicode(textpage, ci))
+                            ch = _codepoint_to_char(code)
+                        except Exception:
+                            ch = ""
+                    if not ch and hasattr(textpage, "get_text_range"):
+                        try:
+                            ch = textpage.get_text_range(ci, 1) or ""
+                        except Exception:
+                            ch = ""
+                        ch = _normalize_single_char(ch)
                     if not ch:
                         continue
                     cx = (float(c_left) + float(c_right)) * 0.5
@@ -230,13 +300,60 @@ class _LayoutParsingPipelineV2(BasePipeline):
                     ],
                     dtype=np.int16,
                 )
-                rec_texts.append(txt)
-                rec_scores.append(1.0)
-                rec_polys.append(poly)
-                dt_polys.append(poly)
+                # Merge with previous span if they are on the same line and horizontally adjacent.
+                # pdfium splits mixed-font runs (e.g. "图1.1": CJK + ASCII) into separate rects;
+                # merging them restores the complete token.
+                _merged = False
+                if rec_texts:
+                    _prev_poly = rec_polys[-1]
+                    _px_min = int(_prev_poly[:, 0].min())
+                    _px_max = int(_prev_poly[:, 0].max())
+                    _py_min = int(_prev_poly[:, 1].min())
+                    _py_max = int(_prev_poly[:, 1].max())
+                    _prev_h = max(1, _py_max - _py_min)
+                    _cur_h = max(1, y_max - y_min)
+                    # y overlap ratio (relative to smaller height)
+                    _y_inter = max(0, min(_py_max, y_max) - max(_py_min, y_min))
+                    _y_overlap = _y_inter / min(_prev_h, _cur_h)
+                    # x gap between the two rects (pixels)
+                    _x_gap = max(0, x_min - _px_max) if x_min >= _px_max else max(0, _px_min - x_max)
+                    _avg_char_w = max(1, (_px_max - _px_min) / max(1, len(rec_texts[-1])))
+                    if _y_overlap >= 0.4 and _x_gap <= max(6, _avg_char_w * 1.2):
+                        # Merge: extend bbox and concatenate text
+                        _new_x_min = min(_px_min, x_min)
+                        _new_x_max = max(_px_max, x_max)
+                        _new_y_min = min(_py_min, y_min)
+                        _new_y_max = max(_py_max, y_max)
+                        _new_poly = np.array(
+                            [
+                                [_new_x_min, _new_y_min],
+                                [_new_x_max, _new_y_min],
+                                [_new_x_max, _new_y_max],
+                                [_new_x_min, _new_y_max],
+                            ],
+                            dtype=np.int16,
+                        )
+                        rec_texts[-1] = rec_texts[-1] + txt
+                        rec_polys[-1] = _new_poly
+                        dt_polys[-1] = _new_poly
+                        _merged = True
+                if not _merged:
+                    rec_texts.append(txt)
+                    rec_scores.append(1.0)
+                    rec_polys.append(poly)
+                    dt_polys.append(poly)
 
             total_chars = sum(len(t) for t in rec_texts)
             if len(rec_texts) < min_rec_boxes or total_chars < min_total_chars:
+                return None
+            enable_page_level_fallback = str(
+                os.environ.get("PADDLE_PDX_ENABLE_PDF_TEXT_GARBLE_FALLBACK", "false")
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if enable_page_level_fallback and self._is_suspicious_pdf_textlayer(rec_texts):
+                logging.debug(
+                    "pdf textlayer deemed suspicious (unreadable), fallback to GeneralOCR: "
+                    f"page_index={page_index}"
+                )
                 return None
 
             rec_boxes = np.array(
@@ -262,6 +379,7 @@ class _LayoutParsingPipelineV2(BasePipeline):
                 "rec_boxes": rec_boxes,
                 "rec_labels": ["text"] * len(rec_texts),
                 "vis_fonts": [],
+                "text_source": "pdf_text",
             }
             return OCRResult(ocr_data)
         except Exception as e:
@@ -1357,6 +1475,7 @@ class _LayoutParsingPipelineV2(BasePipeline):
                     skip_boxes=skip_boxes,
                 )
                 if textlayer_res is not None:
+                    textlayer_res["text_source"] = "pdf_text"
                     overall_ocr_results[i] = textlayer_res
                 else:
                     ocr_fallback_images.append(doc_img)
@@ -1377,6 +1496,7 @@ class _LayoutParsingPipelineV2(BasePipeline):
                 )
                 for idx_in_batch, ocr_res in zip(ocr_fallback_indices, ocr_results_fallback):
                     ocr_res["rec_labels"] = ["text"] * len(ocr_res["rec_texts"])
+                    ocr_res["text_source"] = "ocr_text"
                     overall_ocr_results[idx_in_batch] = ocr_res
 
             # Ensure 1:1 alignment with other per-page results
@@ -1648,6 +1768,18 @@ class _LayoutParsingPipelineV2(BasePipeline):
         global_prev_block = None
 
         global_block_id = 0
+        
+        def _is_number_like_text_block(block: LayoutBlock) -> bool:
+            txt = str(getattr(block, "content", "") or "").strip()
+            if not txt:
+                return False
+            # Typical page-number patterns: "12", "- 12 -", "(12)", "第12页", "12/300"
+            return bool(
+                re.fullmatch(
+                    r"[\(\[（【-]?\s*(?:第\s*)?\d{1,4}(?:\s*/\s*\d{1,4})?\s*(?:页|頁)?\s*[\)\]）】-]?",
+                    txt,
+                )
+            )
 
         for page_index, one_page_blocks in enumerate(blocks_by_page):
             current_page_new_blocks = []
@@ -1662,9 +1794,12 @@ class _LayoutParsingPipelineV2(BasePipeline):
 
                 prev_block = block
 
-                is_text = block.label == "text"
+                # Filter out page-number-like text from cross-page stitching.
+                is_text = block.label == "text" and not _is_number_like_text_block(block)
                 prev_is_text = (
-                    global_prev_block is not None and global_prev_block.label == "text"
+                    global_prev_block is not None
+                    and global_prev_block.label == "text"
+                    and not _is_number_like_text_block(global_prev_block)
                 )
 
                 if is_text and prev_is_text and not seg_start_flag:
